@@ -52,6 +52,7 @@ else
 fi
 gradle_cache="${REPO_ROOT_DIR}/.gradle_cache"
 ssh_path="${HOME}/.ssh/ccm.pem"
+ssh_agent="$SSH_AUTH_SOCK"
 aws_creds_path="${HOME}/.aws/credentials"
 enterprise="true"
 headless="false"
@@ -215,8 +216,8 @@ fi
 volume_args="-v ${REPO_ROOT_DIR}:$WORK_DIR"
 
 # Configure SSH key for getting into the cluster during tests
-if [ -f "$ssh_path" ]; then
-    volume_args="$volume_args -v $ssh_path:/ssh/key" # pass provided key into docker env
+if [ -f "$ssh_agent" ]; then
+    volume_args="$volume_args -v $(dirname $SSH_AUTH_SOCK) -e SSH_AUTH_SOCK=$SSH_AUTH_SOCK" # pass ssh-agent into docker env
 else
     if [ -n "$CLUSTER_URL" ]; then
         # If the user is providing us with a cluster, we require the SSH key for that cluster.
