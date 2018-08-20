@@ -3,13 +3,16 @@
 # TODO: usage, description.
 
 from datetime import date, datetime
-from typing import List
+from typing import List, Any
+import argparse
 import json
 import logging
 import os
 import re
 import retrying
 import sys
+
+sys.path.append(os.path.join(os.path.dirname(__file__), "..", "testing"))
 
 from sdk_utils import groupby
 import sdk_cmd
@@ -24,12 +27,70 @@ DEFAULT_RETRY_WAIT = 1000
 DEFAULT_RETRY_MAX_ATTEMPTS = 5
 
 
-@retrying.retry(
-    wait_fixed=DEFAULT_RETRY_WAIT, stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS
-)
-def _get_task_page(
-    offset: int, limit: int, framework_id: str = None, task_id: str = None
-) -> dict:
+def directory_date_string() -> str:
+    return date.strftime(datetime.now(), "%Y%m%d%H%M%S")
+
+
+def output_directory_name(package_name: str, service_name: str) -> str:
+    return "{}_{}".format(
+        sdk_utils.get_deslashed_service_name(service_name), directory_date_string()
+    )
+
+
+def create_output_directory(package_name: str, service_name: str) -> str:
+    directory_name = output_directory_name(package_name, service_name)
+
+    if not os.path.exists(directory_name):
+        logger.info("Creating directory {}".format(directory_name))
+        os.makedirs(directory_name)
+
+    return directory_name
+
+
+def attached_dcos_cluster() -> (int, Any):
+    rc, stdout, stderr = sdk_cmd.run_raw_cli("cluster list --attached", print_output=False)
+
+    if rc != 0:
+        if "No cluster is attached" in stderr:
+            return (rc, stderr)
+        else:
+            return (False, "Unexpected error\nstdout: '{}'\nstderr: '{}'".format(stdout, stderr))
+
+    (cluster_name, _, dcos_version, cluster_url) = stdout.split("\n")[-1].split()
+    return (rc, (cluster_name, dcos_version, cluster_url))
+
+
+def is_authenticated_to_dcos_cluster() -> (bool, str):
+    rc, stdout, stderr = sdk_cmd.run_raw_cli("service", print_output=False)
+
+    if rc != 0:
+        if "dcos auth login" in stderr:
+            return (False, stderr)
+        else:
+            return (False, "Unexpected error\nstdout: '{}'\nstderr: '{}'".format(stdout, stderr))
+
+    return (True, "Authenticated")
+
+
+def get_marathon_app(service_name: str) -> (int, Any):
+    rc, stdout, stderr = sdk_cmd.run_raw_cli(
+        "marathon app show {}".format(service_name), print_output=False
+    )
+
+    if rc != 0:
+        if "does not exist" in stderr:
+            return (rc, "Service {} does not exist".format(service_name))
+        else:
+            return (rc, "Unexpected error\nstdout: '{}'\nstderr: '{}'".format(stdout, stderr))
+
+    try:
+        return (rc, json.loads(stdout))
+    except Exception as e:
+        return (1, "Error decoding JSON: {}".format(e))
+
+
+@retrying.retry(wait_fixed=DEFAULT_RETRY_WAIT, stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS)
+def _get_task_page(offset: int, limit: int, framework_id: str = None, task_id: str = None) -> dict:
     path = "/mesos/tasks?offset={}&limit={}".format(offset, limit)
 
     if framework_id:
@@ -53,9 +114,7 @@ def _get_tasks(
     if len(page_tasks) < limit:
         return tasks
     else:
-        return _get_tasks(
-            tasks, offset + limit, limit, framework_id=framework_id, task_id=task_id
-        )
+        return _get_tasks(tasks, offset + limit, limit, framework_id=framework_id, task_id=task_id)
 
 
 def get_tasks(framework_id: str = None, task_id: str = None) -> dict:
@@ -66,64 +125,42 @@ def get_tasks(framework_id: str = None, task_id: str = None) -> dict:
     return _get_tasks(tasks, offset, limit, framework_id=framework_id, task_id=task_id)
 
 
-@retrying.retry(
-    wait_fixed=DEFAULT_RETRY_WAIT, stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS
-)
+@retrying.retry(wait_fixed=DEFAULT_RETRY_WAIT, stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS)
 def marathon_app_show(marathon_app_name: str) -> dict:
     return sdk_cmd.get_json_output(
         "marathon app show {}".format(marathon_app_name), print_output=False
     )
 
 
-@retrying.retry(
-    wait_fixed=DEFAULT_RETRY_WAIT, stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS
-)
+@retrying.retry(wait_fixed=DEFAULT_RETRY_WAIT, stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS)
 def get_scheduler_tasks(app: dict) -> dict:
-    return list(
-        map(lambda task: get_tasks(task_id=task["id"])["tasks"][0], app["tasks"])
-    )
+    return list(map(lambda task: get_tasks(task_id=task["id"])["tasks"][0], app["tasks"]))
 
 
-@retrying.retry(
-    wait_fixed=DEFAULT_RETRY_WAIT, stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS
-)
+@retrying.retry(wait_fixed=DEFAULT_RETRY_WAIT, stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS)
 def get_framework_id(package_name: str, service_name: str) -> str:
     framework_ids = sdk_cmd.svc_cli(
-        package_name,
-        service_name,
-        "debug state framework_id",
-        json=True,
-        print_output=False,
+        package_name, service_name, "debug state framework_id", json=True, print_output=False
     )
 
-    assert len(framework_ids) == 1, "More than 1 Framework ID returned: {}".format(
-        framework_ids
-    )
+    assert len(framework_ids) == 1, "More than 1 Framework ID returned: {}".format(framework_ids)
 
     return framework_ids[0]
 
 
-@retrying.retry(
-    wait_fixed=DEFAULT_RETRY_WAIT, stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS
-)
+@retrying.retry(wait_fixed=DEFAULT_RETRY_WAIT, stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS)
 def debug_agent_files(agent_id: str) -> List[str]:
-    return sdk_cmd.cluster_request(
-        "GET", "/slave/{}/files/debug".format(agent_id)
-    ).json()
+    return sdk_cmd.cluster_request("GET", "/slave/{}/files/debug".format(agent_id)).json()
 
 
-@retrying.retry(
-    wait_fixed=DEFAULT_RETRY_WAIT, stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS
-)
+@retrying.retry(wait_fixed=DEFAULT_RETRY_WAIT, stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS)
 def browse_agent_path(agent_id: str, agent_path: str) -> List[dict]:
     return sdk_cmd.cluster_request(
         "GET", "/slave/{}/files/browse?path={}".format(agent_id, agent_path)
     ).json()
 
 
-@retrying.retry(
-    wait_fixed=DEFAULT_RETRY_WAIT, stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS
-)
+@retrying.retry(wait_fixed=DEFAULT_RETRY_WAIT, stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS)
 def browse_executor_sandbox(agent_id: str, executor_sandbox_path: str) -> List[dict]:
     return browse_agent_path(agent_id, executor_sandbox_path)
 
@@ -132,8 +169,7 @@ def browse_executor_tasks(agent_id: str, executor_sandbox_path: str) -> List[dic
     executor_sandbox = browse_executor_sandbox(agent_id, executor_sandbox_path)
     tasks_directory = next(
         filter(
-            lambda f: f["mode"].startswith("d") and f["path"].endswith("/tasks"),
-            executor_sandbox,
+            lambda f: f["mode"].startswith("d") and f["path"].endswith("/tasks"), executor_sandbox
         ),
         None,
     )
@@ -144,33 +180,23 @@ def browse_executor_tasks(agent_id: str, executor_sandbox_path: str) -> List[dic
         return []
 
 
-@retrying.retry(
-    wait_fixed=DEFAULT_RETRY_WAIT, stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS
-)
-def browse_task_sandbox(
-    agent_id: str, executor_sandbox_path: str, task_id: str
-) -> List[dict]:
+@retrying.retry(wait_fixed=DEFAULT_RETRY_WAIT, stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS)
+def browse_task_sandbox(agent_id: str, executor_sandbox_path: str, task_id: str) -> List[dict]:
     executor_tasks = browse_executor_tasks(agent_id, executor_sandbox_path)
 
     if executor_tasks:
-        task_sandbox_path = os.path.join(
-            executor_sandbox_path, "tasks/{}/".format(task_id)
-        )
+        task_sandbox_path = os.path.join(executor_sandbox_path, "tasks/{}/".format(task_id))
         return browse_agent_path(agent_id, task_sandbox_path)
     else:
         return []
 
 
-@retrying.retry(
-    wait_fixed=DEFAULT_RETRY_WAIT, stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS
-)
+@retrying.retry(wait_fixed=DEFAULT_RETRY_WAIT, stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS)
 def download_agent_path(
     agent_id: str, agent_file_path: str, output_file_path: str, chunk_size: int = 8192
 ) -> None:
     stream = sdk_cmd.cluster_request(
-        "GET",
-        "/slave/{}/files/download?path={}".format(agent_id, agent_file_path),
-        stream=True,
+        "GET", "/slave/{}/files/download?path={}".format(agent_id, agent_file_path), stream=True
     )
     with open(output_file_path, "wb") as f:
         for chunk in stream.iter_content(chunk_size=chunk_size):
@@ -178,10 +204,7 @@ def download_agent_path(
 
 
 def download_sandbox_files(
-    agent_id: str,
-    sandbox: List[dict],
-    output_base_path: str,
-    patterns_to_download: List[str] = [],
+    agent_id: str, sandbox: List[dict], output_base_path: str, patterns_to_download: List[str] = []
 ) -> List[dict]:
     if not os.path.exists(output_base_path):
         os.makedirs(output_base_path)
@@ -191,9 +214,7 @@ def download_sandbox_files(
         for pattern in patterns_to_download:
             if re.match(pattern, task_file_basename):
                 download_agent_path(
-                    agent_id,
-                    task_file["path"],
-                    os.path.join(output_base_path, task_file_basename),
+                    agent_id, task_file["path"], os.path.join(output_base_path, task_file_basename)
                 )
 
 
@@ -221,9 +242,7 @@ def download_task_files(
     # Scheduler task: no parent executor, download only scheduler logs.
     else:
         output_directory = os.path.join(base_path, task_id)
-        download_sandbox_files(
-            agent_id, task_sandbox, output_directory, patterns_to_download
-        )
+        download_sandbox_files(agent_id, task_sandbox, output_directory, patterns_to_download)
 
 
 class Bundle(object):
@@ -231,14 +250,10 @@ class Bundle(object):
         self.package_name = package_name
         self.service_name = service_name
         self.directory_name = directory_name
-        self.framework_id = get_framework_id(self.package_name, self.service_name)
 
     def tasks_with_state(self, state):
         return list(
-            filter(
-                lambda task: task["state"] == state,
-                get_tasks(self.framework_id)["tasks"],
-            )
+            filter(lambda task: task["state"] == state, get_tasks(self.framework_id)["tasks"])
         )
 
     def running_tasks(self):
@@ -246,10 +261,7 @@ class Bundle(object):
 
     def tasks_with_state_and_prefix(self, state, prefix):
         return list(
-            filter(
-                lambda task: task["name"].startswith(prefix),
-                self.tasks_with_state(state),
-            )
+            filter(lambda task: task["name"].startswith(prefix), self.tasks_with_state(state))
         )
 
     def write_file(self, file_name, content, serialize_to_json=False):
@@ -275,9 +287,7 @@ class Bundle(object):
         task_ids = list(
             map(
                 lambda task: task["id"],
-                filter(
-                    lambda task: task["name"].startswith(prefix), self.running_tasks()
-                ),
+                filter(lambda task: task["name"].startswith(prefix), self.running_tasks()),
             )
         )
         self.run_on_tasks(fn, task_ids)
@@ -293,8 +303,7 @@ class BaseTechBundle(Bundle):
 
 class CassandraBundle(BaseTechBundle):
     @retrying.retry(
-        wait_fixed=DEFAULT_RETRY_WAIT,
-        stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS,
+        wait_fixed=DEFAULT_RETRY_WAIT, stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS
     )
     def task_exec(self, task_id, cmd):
         full_cmd = " ".join(
@@ -309,16 +318,12 @@ class CassandraBundle(BaseTechBundle):
         return sdk_cmd.marathon_task_exec(task_id, "bash -c '{}'".format(full_cmd))
 
     def create_nodetool_status_file(self, task_id):
-        rc, stdout, stderr = self.task_exec(
-            task_id, "${CASSANDRA_DIRECTORY}/bin/nodetool status"
-        )
+        rc, stdout, stderr = self.task_exec(task_id, "${CASSANDRA_DIRECTORY}/bin/nodetool status")
 
         self.write_file("cassandra_nodetool_status_{}.txt".format(task_id), stdout)
 
     def create_nodetool_tpstats_file(self, task_id):
-        rc, stdout, stderr = self.task_exec(
-            task_id, "${CASSANDRA_DIRECTORY}/bin/nodetool tpstats"
-        )
+        rc, stdout, stderr = self.task_exec(task_id, "${CASSANDRA_DIRECTORY}/bin/nodetool tpstats")
 
         self.write_file("cassandra_nodetool_tpstats_{}.txt".format(task_id), stdout)
 
@@ -326,9 +331,7 @@ class CassandraBundle(BaseTechBundle):
         self.for_each_running_task_with_prefix("node", self.create_nodetool_status_file)
 
     def create_tasks_nodetool_tpstats_files(self):
-        self.for_each_running_task_with_prefix(
-            "node", self.create_nodetool_tpstats_file
-        )
+        self.for_each_running_task_with_prefix("node", self.create_nodetool_tpstats_file)
 
     def create(self):
         logger.info("Creating Cassandra bundle")
@@ -338,8 +341,7 @@ class CassandraBundle(BaseTechBundle):
 
 class ElasticBundle(BaseTechBundle):
     @retrying.retry(
-        wait_fixed=DEFAULT_RETRY_WAIT,
-        stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS,
+        wait_fixed=DEFAULT_RETRY_WAIT, stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS
     )
     def task_exec(self, task_id, cmd):
         full_cmd = " ".join(
@@ -392,42 +394,36 @@ class ServiceBundle(Bundle):
     DOWNLOAD_FILES_WITH_PATTERNS = ["^stdout(\.\d+)?$", "^stderr(\.\d+)?$"]
 
     @retrying.retry(
-        wait_fixed=DEFAULT_RETRY_WAIT,
-        stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS,
+        wait_fixed=DEFAULT_RETRY_WAIT, stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS
     )
     def install_service_cli(self):
         sdk_cmd.run_cli(
-            "package install {} --cli --yes".format(self.package_name),
-            print_output=False,
+            "package install {} --cli --yes".format(self.package_name), print_output=False
         )
 
     @retrying.retry(
-        wait_fixed=DEFAULT_RETRY_WAIT,
-        stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS,
+        wait_fixed=DEFAULT_RETRY_WAIT, stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS
     )
     def create_dcos_version_file(self):
         output = sdk_cmd.run_cli("--version", print_output=False)
         self.write_file("dcos_version.txt", output)
 
     @retrying.retry(
-        wait_fixed=DEFAULT_RETRY_WAIT,
-        stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS,
+        wait_fixed=DEFAULT_RETRY_WAIT, stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS
     )
     def create_task_file(self):
         output = sdk_cmd.run_cli("task --json", print_output=False)
         self.write_file("dcos_task.json", output)
 
     @retrying.retry(
-        wait_fixed=DEFAULT_RETRY_WAIT,
-        stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS,
+        wait_fixed=DEFAULT_RETRY_WAIT, stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS
     )
     def create_marathon_task_list_file(self):
         output = sdk_cmd.run_cli("marathon task list --json", print_output=False)
         self.write_file("dcos_marathon_task_list.json", output)
 
     @retrying.retry(
-        wait_fixed=DEFAULT_RETRY_WAIT,
-        stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS,
+        wait_fixed=DEFAULT_RETRY_WAIT, stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS
     )
     def create_configuration_file(self):
         output = sdk_cmd.svc_cli(
@@ -437,22 +433,17 @@ class ServiceBundle(Bundle):
         self.write_file("service_configuration.json", output)
 
     @retrying.retry(
-        wait_fixed=DEFAULT_RETRY_WAIT,
-        stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS,
+        wait_fixed=DEFAULT_RETRY_WAIT, stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS
     )
     def create_pod_status_file(self):
         output = sdk_cmd.svc_cli(
-            self.package_name,
-            self.service_name,
-            "pod status --json",
-            print_output=False,
+            self.package_name, self.service_name, "pod status --json", print_output=False
         )
 
         self.write_file("service_pod_status.json", output)
 
     @retrying.retry(
-        wait_fixed=DEFAULT_RETRY_WAIT,
-        stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS,
+        wait_fixed=DEFAULT_RETRY_WAIT, stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS
     )
     def create_plan_status_file(self, plan):
         output = sdk_cmd.svc_cli(
@@ -465,16 +456,11 @@ class ServiceBundle(Bundle):
         self.write_file("service_plan_status_{}.json".format(plan), output)
 
     @retrying.retry(
-        wait_fixed=DEFAULT_RETRY_WAIT,
-        stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS,
+        wait_fixed=DEFAULT_RETRY_WAIT, stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS
     )
     def create_plans_status_files(self):
         plans = sdk_cmd.svc_cli(
-            self.package_name,
-            self.service_name,
-            "plan list",
-            json=True,
-            print_output=False,
+            self.package_name, self.service_name, "plan list", json=True, print_output=False
         )
 
         for plan in plans:
@@ -485,9 +471,7 @@ class ServiceBundle(Bundle):
         pod_tasks = get_tasks(self.framework_id)["tasks"]
         all_tasks = scheduler_tasks + pod_tasks
         tasks_by_agent_id = dict(groupby("slave_id", all_tasks))
-        agent_id_by_task_ids = dict(
-            map(lambda task: (task["id"], task["slave_id"]), all_tasks)
-        )
+        agent_id_by_task_ids = dict(map(lambda task: (task["id"], task["slave_id"]), all_tasks))
 
         agent_executor_paths = {}
         for agent_id in tasks_by_agent_id.keys():
@@ -496,9 +480,7 @@ class ServiceBundle(Bundle):
         task_executor_sandbox_paths = {}
         for agent_id, tasks in tasks_by_agent_id.items():
             for task in tasks:
-                task_executor_sandbox_paths[
-                    task["id"]
-                ] = sdk_diag._find_matching_executor_path(
+                task_executor_sandbox_paths[task["id"]] = sdk_diag._find_matching_executor_path(
                     agent_executor_paths[agent_id], sdk_diag._TaskEntry(task)
                 )
 
@@ -513,53 +495,140 @@ class ServiceBundle(Bundle):
             )
 
     def create(self):
-        self.install_service_cli()
-        self.create_dcos_version_file()
-        self.create_task_file()
-        self.create_marathon_task_list_file()
-        self.create_configuration_file()
-        self.create_pod_status_file()
-        self.create_plans_status_files()
-        self.create_log_files()
-        BASE_TECH_BUNDLE[self.package_name](
-            self.package_name, self.service_name, self.directory_name
-        ).create()
+        # self.install_service_cli()
+        # self.framework_id = get_framework_id(self.package_name, self.service_name)
+        # self.create_dcos_version_file()
+        # self.create_task_file()
+        # self.create_marathon_task_list_file()
+        # self.create_configuration_file()
+        # self.create_pod_status_file()
+        # self.create_plans_status_files()
+        # self.create_log_files()
+
+        base_tech_bundle = BASE_TECH_BUNDLE.get(self.package_name)
+
+        if base_tech_bundle:
+            base_tech_bundle(self.package_name, self.service_name, self.directory_name).create()
+        else:
+            logger.info(
+                "Don't know how to get base tech diagnostics for package '%s'", self.package_name
+            )
+            logger.info(
+                "Supported packages:\n%s",
+                "\n".join(["- {}".format(k) for k in sorted(BASE_TECH_BUNDLE.keys())]),
+            )
 
 
-def print_usage(argv):
-    logger.info("TODO: usage")
+def parse_args() -> dict:
+    parser = argparse.ArgumentParser(description="Create an SDK service Diagnostics bundle")
+
+    parser.add_argument(
+        "--package-name",
+        type=str,
+        required=True,
+        default=None,
+        help="The package name for the service to create the bundle for",
+    )
+
+    parser.add_argument(
+        "--service-name",
+        type=str,
+        required=True,
+        default=None,
+        help="The service name to create the bundle for",
+    )
+
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Disable interactive mode and assume 'yes' is the answer to all prompts.",
+    )
+
+    return parser.parse_args()
+
+
+def preflight_check() -> (int, bool, dict):
+    args = parse_args()
+    package_name_given = args.package_name
+    service_name = args.service_name
+    should_prompt_user = not args.yes
+
+    (is_authenticated, message) = is_authenticated_to_dcos_cluster()
+    if not is_authenticated:
+        logger.error(
+            "We were unable to verify that you're authenticated to a DC/OS cluster.\nError: %s",
+            message,
+        )
+        return (1, False, {})
+
+    (rc, cluster_or_error) = attached_dcos_cluster()
+    if rc != 0:
+        logger.error(
+            "We were unable to verify the cluster you're attached to.\nError: %s",
+            service_name,
+            cluster_or_error,
+        )
+        return (rc, False, {})
+
+    (cluster_name, dcos_version, cluster_url) = cluster_or_error
+
+    (rc, marathon_app_or_error) = get_marathon_app(service_name)
+    if rc == 0:
+        package_name = marathon_app_or_error.get("labels", {}).get("DCOS_PACKAGE_NAME")
+        package_version = marathon_app_or_error.get("labels", {}).get("DCOS_PACKAGE_VERSION")
+    else:
+        logger.warn(
+            "We were unable to get details about %s.\nError: %s",
+            service_name,
+            marathon_app_or_error,
+        )
+        package_name = package_name_given
+        package_version = "n/a"
+
+    if package_name_given != package_name:
+        logger.error(
+            "Package name given '%s' is different than actual '%s' package name: '%s'",
+            package_name_given,
+            service_name,
+            package_name,
+        )
+        return (1, False, {})
+
+    return (
+        0,
+        True,
+        {
+            "package_name": package_name,
+            "service_name": service_name,
+            "package_version": package_version,
+            "cluster_name": cluster_name,
+            "dcos_version": dcos_version,
+            "cluster_url": cluster_url,
+            "should_prompt_user": should_prompt_user,
+        },
+    )
 
 
 def main(argv):
-    if len(argv) < 2:
-        print_usage(argv)
-        return 1
+    (rc, should_proceed, args) = preflight_check()
+    if not should_proceed:
+        return rc
 
-    package_name = argv[1]
-    service_name = argv[2]
+    logger.info("\nWill create bundle for:")
+    logger.info("  Package:         %s", args.get("package_name"))
+    logger.info("  Package version: %s", args.get("package_version"))
+    logger.info("  Service name:    %s", args.get("service_name"))
+    logger.info("  DC/OS version:   %s", args.get("dcos_version"))
+    logger.info("  Cluster URL:     %s\n", args.get("cluster_url"))
 
-    def directory_date_string():
-        return date.strftime(datetime.now(), "%Y%m%d%H%M%S")
+    if args.get("should_prompt_user"):
+        answer = input("\nProceed? [Y/n]: ")
+        if answer.strip().lower() in ["n", "no", "false"]:
+            return 0
 
-    def directory_name(package_name, service_name):
-        return "{}_{}_{}".format(
-            package_name,
-            sdk_utils.get_deslashed_service_name(service_name),
-            directory_date_string(),
-        )
+    output_directory = create_output_directory(args.get("package_name"), args.get("service_name"))
 
-    def create_directory(package_name, service_name):
-        _directory_name = directory_name(package_name, service_name)
-
-        if not os.path.exists(_directory_name):
-            logger.info("Creating directory {}".format(_directory_name))
-            os.makedirs(_directory_name)
-
-        return _directory_name
-
-    ServiceBundle(
-        package_name, service_name, create_directory(package_name, service_name)
-    ).create()
+    ServiceBundle(args.get("package_name"), args.get("service_name"), output_directory).create()
 
     return 0
 
