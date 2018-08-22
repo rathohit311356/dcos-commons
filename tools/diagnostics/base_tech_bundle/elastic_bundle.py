@@ -138,17 +138,6 @@ def get_scheduler_tasks(app: dict) -> dict:
 
 
 @retrying.retry(wait_fixed=DEFAULT_RETRY_WAIT, stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS)
-def get_framework_id(package_name: str, service_name: str) -> str:
-    framework_ids = sdk_cmd.svc_cli(
-        package_name, service_name, "debug state framework_id", json=True, print_output=False
-    )
-
-    assert len(framework_ids) == 1, "More than 1 Framework ID returned: {}".format(framework_ids)
-
-    return framework_ids[0]
-
-
-@retrying.retry(wait_fixed=DEFAULT_RETRY_WAIT, stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS)
 def debug_agent_files(agent_id: str) -> List[str]:
     return sdk_cmd.cluster_request("GET", "/slave/{}/files/debug".format(agent_id)).json()
 
@@ -246,24 +235,6 @@ def download_task_files(
 
 
 class Bundle(object):
-    def __init__(self, package_name, service_name, directory_name):
-        self.package_name = package_name
-        self.service_name = service_name
-        self.directory_name = directory_name
-
-    def tasks_with_state(self, state):
-        return list(
-            filter(lambda task: task["state"] == state, get_tasks(self.framework_id)["tasks"])
-        )
-
-    def running_tasks(self):
-        return self.tasks_with_state("TASK_RUNNING")
-
-    def tasks_with_state_and_prefix(self, state, prefix):
-        return list(
-            filter(lambda task: task["name"].startswith(prefix), self.tasks_with_state(state))
-        )
-
     def write_file(self, file_name, content, serialize_to_json=False):
         file_path = os.path.join(self.directory_name, file_name)
 
@@ -274,6 +245,34 @@ class Bundle(object):
             else:
                 f.write(content)
                 f.write("\n")
+
+    def create(self):
+        raise NotImplementedError
+
+
+class ServiceBundle(Bundle):
+    DOWNLOAD_FILES_WITH_PATTERNS = ["^stdout(\.\d+)?$", "^stderr(\.\d+)?$"]
+
+    def __init__(self, package_name, service_name, directory_name):
+        self.package_name = package_name
+        self.service_name = service_name
+        self.directory_name = directory_name
+
+    def tasks(self):
+        return get_tasks(self.framework_id)["tasks"]
+
+    def tasks_with_state(self, state):
+        return list(
+            filter(lambda task: task["state"] == state, self.tasks())
+        )
+
+    def running_tasks(self):
+        return self.tasks_with_state("TASK_RUNNING")
+
+    def tasks_with_state_and_prefix(self, state, prefix):
+        return list(
+            filter(lambda task: task["name"].startswith(prefix), self.tasks_with_state(state))
+        )
 
     def run_on_tasks(self, fn, task_ids):
         for task_id in task_ids:
@@ -292,135 +291,15 @@ class Bundle(object):
         )
         self.run_on_tasks(fn, task_ids)
 
-    def create(self):
-        raise NotImplementedError
-
-
-class BaseTechBundle(Bundle):
-    def task_exec(self):
-        raise NotImplementedError
-
-
-class CassandraBundle(BaseTechBundle):
-    @retrying.retry(
-        wait_fixed=DEFAULT_RETRY_WAIT, stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS
-    )
-    def task_exec(self, task_id, cmd):
-        full_cmd = " ".join(
-            [
-                "export JAVA_HOME=$(ls -d ${MESOS_SANDBOX}/jdk*/jre/) &&",
-                "export TASK_IP=$(${MESOS_SANDBOX}/bootstrap --get-task-ip) &&",
-                "CASSANDRA_DIRECTORY=$(ls -d ${MESOS_SANDBOX}/apache-cassandra-*/) &&",
-                cmd,
-            ]
+    @retrying.retry(wait_fixed=DEFAULT_RETRY_WAIT, stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS)
+    def get_framework_id(self) -> str:
+        framework_ids = sdk_cmd.svc_cli(
+            self.package_name, self.service_name, "debug state framework_id", json=True, print_output=False
         )
 
-        return sdk_cmd.marathon_task_exec(task_id, "bash -c '{}'".format(full_cmd))
+        assert len(framework_ids) == 1, "More than 1 Framework ID returned: {}".format(framework_ids)
 
-    def create_nodetool_status_file(self, task_id):
-        rc, stdout, stderr = self.task_exec(task_id, "${CASSANDRA_DIRECTORY}/bin/nodetool status")
-
-        self.write_file("cassandra_nodetool_status_{}.txt".format(task_id), stdout)
-
-    def create_nodetool_tpstats_file(self, task_id):
-        rc, stdout, stderr = self.task_exec(task_id, "${CASSANDRA_DIRECTORY}/bin/nodetool tpstats")
-
-        self.write_file("cassandra_nodetool_tpstats_{}.txt".format(task_id), stdout)
-
-    def create_tasks_nodetool_status_files(self):
-        self.for_each_running_task_with_prefix("node", self.create_nodetool_status_file)
-
-    def create_tasks_nodetool_tpstats_files(self):
-        self.for_each_running_task_with_prefix("node", self.create_nodetool_tpstats_file)
-
-    def create(self):
-        logger.info("Creating Cassandra bundle")
-        self.create_tasks_nodetool_status_files()
-        self.create_tasks_nodetool_tpstats_files()
-
-
-class ElasticBundle(BaseTechBundle):
-    @retrying.retry(
-        wait_fixed=DEFAULT_RETRY_WAIT, stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS
-    )
-    def task_exec(self, task_id, cmd):
-        full_cmd = " ".join(
-            [
-                "export JAVA_HOME=$(ls -d ${MESOS_SANDBOX}/jdk*/jre/) &&",
-                "export TASK_IP=$(${MESOS_SANDBOX}/bootstrap --get-task-ip) &&",
-                "ELASTICSEARCH_DIRECTORY=$(ls -d ${MESOS_SANDBOX}/elasticsearch-*/) &&",
-                cmd,
-            ]
-        )
-
-        return sdk_cmd.marathon_task_exec(task_id, "bash -c '{}'".format(full_cmd))
-
-    def create_stats_file(self, task_id):
-        command = "curl -s ${MESOS_CONTAINER_IP}:${PORT_HTTP}/_stats"
-        rc, stdout, stderr = self.task_exec(task_id, command)
-        self.write_file("elasticsearch_stats_{}.json".format(task_id), stdout)
-
-    def create_tasks_stats_files(self):
-        self.for_each_running_task_with_prefix("master", self.create_stats_file)
-
-    def create(self):
-        logger.info("Creating Elastic bundle")
-        self.create_tasks_stats_files()
-
-
-class HdfsBundle(BaseTechBundle):
-    def create(self):
-        logger.info("Creating HDFS bundle")
-
-
-class KafkaBundle(BaseTechBundle):
-    def create(self):
-        logger.info("Creating Kafka bundle")
-
-
-BASE_TECH_BUNDLE = {
-    "beta-cassandra": CassandraBundle,
-    "beta-elastic": ElasticBundle,
-    "beta-hdfs": HdfsBundle,
-    "beta-kafka": KafkaBundle,
-    "cassandra": CassandraBundle,
-    "elastic": ElasticBundle,
-    "hdfs": HdfsBundle,
-    "kafka": KafkaBundle,
-}
-
-
-class ServiceBundle(Bundle):
-    DOWNLOAD_FILES_WITH_PATTERNS = ["^stdout(\.\d+)?$", "^stderr(\.\d+)?$"]
-
-    @retrying.retry(
-        wait_fixed=DEFAULT_RETRY_WAIT, stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS
-    )
-    def install_service_cli(self):
-        sdk_cmd.run_cli(
-            "package install {} --cli --yes".format(self.package_name), print_output=False
-        )
-
-    @retrying.retry(
-        wait_fixed=DEFAULT_RETRY_WAIT, stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS
-    )
-    def create_dcos_version_file(self):
-        output = sdk_cmd.run_cli("--version", print_output=False)
-        self.write_file("dcos_version.txt", output)
-
-    @retrying.retry(
-        wait_fixed=DEFAULT_RETRY_WAIT, stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS
-    )
-    def create_task_file(self):
-        output = sdk_cmd.run_cli("task --json", print_output=False)
-        self.write_file("dcos_task.json", output)
-
-    @retrying.retry(
-        wait_fixed=DEFAULT_RETRY_WAIT, stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS
-    )
-    def create_marathon_task_list_file(self):
-        output = sdk_cmd.run_cli("marathon task list --json", print_output=False)
-        self.write_file("dcos_marathon_task_list.json", output)
+        self.framework_id = framework_ids[0]
 
     @retrying.retry(
         wait_fixed=DEFAULT_RETRY_WAIT, stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS
@@ -495,15 +374,157 @@ class ServiceBundle(Bundle):
             )
 
     def create(self):
-        # self.install_service_cli()
-        # self.framework_id = get_framework_id(self.package_name, self.service_name)
-        # self.create_dcos_version_file()
-        # self.create_task_file()
-        # self.create_marathon_task_list_file()
-        # self.create_configuration_file()
-        # self.create_pod_status_file()
-        # self.create_plans_status_files()
-        # self.create_log_files()
+        self.get_framework_id()
+        self.create_configuration_file()
+        self.create_pod_status_file()
+        self.create_plans_status_files()
+        self.create_log_files()
+
+
+class BaseTechBundle(ServiceBundle):
+    def task_exec(self):
+        raise NotImplementedError
+
+    def create(self):
+        raise NotImplementedError
+
+
+class CassandraBundle(BaseTechBundle):
+    @retrying.retry(
+        wait_fixed=DEFAULT_RETRY_WAIT, stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS
+    )
+    def task_exec(self, task_id, cmd):
+        full_cmd = " ".join(
+            [
+                "export JAVA_HOME=$(ls -d ${MESOS_SANDBOX}/jdk*/jre/) &&",
+                "export TASK_IP=$(${MESOS_SANDBOX}/bootstrap --get-task-ip) &&",
+                "CASSANDRA_DIRECTORY=$(ls -d ${MESOS_SANDBOX}/apache-cassandra-*/) &&",
+                cmd,
+            ]
+        )
+
+        return sdk_cmd.marathon_task_exec(task_id, "bash -c '{}'".format(full_cmd))
+
+    def create_nodetool_status_file(self, task_id):
+        rc, stdout, stderr = self.task_exec(task_id, "${CASSANDRA_DIRECTORY}/bin/nodetool status")
+
+        self.write_file("cassandra_nodetool_status_{}.txt".format(task_id), stdout)
+
+    def create_nodetool_tpstats_file(self, task_id):
+        rc, stdout, stderr = self.task_exec(task_id, "${CASSANDRA_DIRECTORY}/bin/nodetool tpstats")
+
+        self.write_file("cassandra_nodetool_tpstats_{}.txt".format(task_id), stdout)
+
+    def create_tasks_nodetool_status_files(self):
+        self.for_each_running_task_with_prefix("node", self.create_nodetool_status_file)
+
+    def create_tasks_nodetool_tpstats_files(self):
+        self.for_each_running_task_with_prefix("node", self.create_nodetool_tpstats_file)
+
+    def create(self):
+        logger.info("Creating Cassandra bundle")
+        self.create_tasks_nodetool_status_files()
+        self.create_tasks_nodetool_tpstats_files()
+
+
+class ElasticBundle(BaseTechBundle):
+    @retrying.retry(
+        wait_fixed=DEFAULT_RETRY_WAIT, stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS
+    )
+    def task_exec(self, task_id, cmd):
+        full_cmd = " ".join(
+            [
+                "export JAVA_HOME=$(ls -d ${MESOS_SANDBOX}/jdk*/jre/) &&",
+                "export TASK_IP=$(${MESOS_SANDBOX}/bootstrap --get-task-ip) &&",
+                "ELASTICSEARCH_DIRECTORY=$(ls -d ${MESOS_SANDBOX}/elasticsearch-*/) &&",
+                cmd,
+            ]
+        )
+
+        return sdk_cmd.marathon_task_exec(task_id, "bash -c '{}'".format(full_cmd))
+
+    def create_stats_file(self, task_id):
+        command = "curl -s ${MESOS_CONTAINER_IP}:${PORT_HTTP}/_stats"
+        rc, stdout, stderr = self.task_exec(task_id, command)
+        self.write_file("elasticsearch_stats_{}.json".format(task_id), stdout)
+
+    def create_tasks_stats_files(self):
+        self.for_each_running_task_with_prefix("master", self.create_stats_file)
+
+    def create(self):
+        logger.info("Creating Elastic bundle")
+        self.create_tasks_stats_files()
+
+
+class HdfsBundle(BaseTechBundle):
+    def create(self):
+        logger.info("Creating HDFS bundle (noop)")
+
+
+class KafkaBundle(BaseTechBundle):
+    def create(self):
+        logger.info("Creating Kafka bundle (noop)")
+
+
+BASE_TECH_BUNDLE = {
+    "beta-cassandra": CassandraBundle,
+    "beta-elastic": ElasticBundle,
+    "beta-hdfs": HdfsBundle,
+    "beta-kafka": KafkaBundle,
+    "cassandra": CassandraBundle,
+    "elastic": ElasticBundle,
+    "hdfs": HdfsBundle,
+    "kafka": KafkaBundle,
+}
+
+class DcosBundle(Bundle):
+    def __init__(self, directory_name):
+        self.directory_name = directory_name
+
+    @retrying.retry(
+        wait_fixed=DEFAULT_RETRY_WAIT, stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS
+    )
+    def create_dcos_version_file(self):
+        output = sdk_cmd.run_cli("--version", print_output=False)
+        self.write_file("dcos_version.txt", output)
+
+    @retrying.retry(
+        wait_fixed=DEFAULT_RETRY_WAIT, stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS
+    )
+    def create_task_file(self):
+        output = sdk_cmd.run_cli("task --json", print_output=False)
+        self.write_file("dcos_task.json", output)
+
+    @retrying.retry(
+        wait_fixed=DEFAULT_RETRY_WAIT, stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS
+    )
+    def create_marathon_task_list_file(self):
+        output = sdk_cmd.run_cli("marathon task list --json", print_output=False)
+        self.write_file("dcos_marathon_task_list.json", output)
+
+    def create(self):
+        self.create_dcos_version_file()
+        self.create_task_file()
+        self.create_marathon_task_list_file()
+
+class FullBundle(Bundle):
+    def __init__(self, package_name, service_name, directory_name):
+        self.package_name = package_name
+        self.service_name = service_name
+        self.directory_name = directory_name
+
+    @retrying.retry(
+        wait_fixed=DEFAULT_RETRY_WAIT, stop_max_attempt_number=DEFAULT_RETRY_MAX_ATTEMPTS
+    )
+    def install_service_cli(self):
+        sdk_cmd.run_cli(
+            "package install {} --cli --yes".format(self.package_name), print_output=False
+        )
+
+    def create(self):
+        DcosBundle(self.directory_name).create()
+
+        ServiceBundle(self.package_name, self.service_name, self.directory_name).create()
 
         base_tech_bundle = BASE_TECH_BUNDLE.get(self.package_name)
 
@@ -517,6 +538,8 @@ class ServiceBundle(Bundle):
                 "Supported packages:\n%s",
                 "\n".join(["- {}".format(k) for k in sorted(BASE_TECH_BUNDLE.keys())]),
             )
+
+        logger.info("Done!")
 
 
 def parse_args() -> dict:
@@ -628,7 +651,7 @@ def main(argv):
 
     output_directory = create_output_directory(args.get("package_name"), args.get("service_name"))
 
-    ServiceBundle(args.get("package_name"), args.get("service_name"), output_directory).create()
+    FullBundle(args.get("package_name"), args.get("service_name"), output_directory).create()
 
     return 0
 
