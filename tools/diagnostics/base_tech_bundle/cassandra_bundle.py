@@ -1,19 +1,13 @@
-from datetime import date, datetime
-from typing import List, Any
-import argparse
-import json
 import logging
 import os
-import re
 import retrying
 import sys
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "testing"))
 
-from sdk_utils import groupby
 import sdk_cmd
-import sdk_diag
-import sdk_utils
+
+from diagnostics.base_tech_bundle import BaseTechBundle
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(message)s")

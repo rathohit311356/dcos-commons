@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 
 from datetime import date, datetime
-import typing
+from typing import Any
 import argparse
+import json
 import logging
 import os
 import sys
@@ -12,17 +13,37 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "."))
 
 from diagnostics import FullBundle
 import sdk_utils
+import sdk_cmd
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+
+def current_cluster_name() -> (bool, str):
+    rc, stdout, stderr = sdk_cmd.run_raw_cli("config show cluster.name", print_output=False)
+
+    if rc != 0:
+        return (False, "Unexpected error\nstdout: '{}'\nstderr: '{}'".format(stdout, stderr))
+
+    return (True, stdout)
 
 
 def is_authenticated_to_dcos_cluster() -> (bool, str):
     rc, stdout, stderr = sdk_cmd.run_raw_cli("service", print_output=False)
 
     if rc != 0:
+        (success, cluster_name_or_error) = current_cluster_name()
+
         if "dcos auth login" in stderr:
-            return (False, stderr)
+            if success:
+                return (
+                    False,
+                    "Not authenticated to {}. Please run `dcos auth login`".format(
+                        cluster_name_or_error
+                    ),
+                )
+            else:
+                return (False, stderr)
         else:
             return (False, "Unexpected error\nstdout: '{}'\nstderr: '{}'".format(stdout, stderr))
 
@@ -55,8 +76,36 @@ def get_marathon_app(service_name: str) -> (int, Any):
 
     try:
         return (rc, json.loads(stdout))
-    except Exception as e:
+    except json.JSONDecodeError as e:
         return (1, "Error decoding JSON: {}".format(e))
+
+
+def parse_args() -> dict:
+    parser = argparse.ArgumentParser(description="Create an SDK service Diagnostics bundle")
+
+    parser.add_argument(
+        "--package-name",
+        type=str,
+        required=True,
+        default=None,
+        help="The package name for the service to create the bundle for",
+    )
+
+    parser.add_argument(
+        "--service-name",
+        type=str,
+        required=True,
+        default=None,
+        help="The service name to create the bundle for",
+    )
+
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Disable interactive mode and assume 'yes' is the answer to all prompts.",
+    )
+
+    return parser.parse_args()
 
 
 def preflight_check() -> (int, bool, dict):
@@ -89,10 +138,15 @@ def preflight_check() -> (int, bool, dict):
         package_name = marathon_app_or_error.get("labels", {}).get("DCOS_PACKAGE_NAME")
         package_version = marathon_app_or_error.get("labels", {}).get("DCOS_PACKAGE_VERSION")
     else:
-        logger.warn(
-            "We were unable to get details about %s.\nError: %s",
+        logger.info(
+            "We were unable to get details about '%s'.\nIssue: %s",
             service_name,
             marathon_app_or_error,
+        )
+        logger.info(
+            "Maybe the '%s' scheduler is not running. That's ok, we can still try to fetch any "
+            + "artifacts related to it",
+            service_name,
         )
         package_name = package_name_given
         package_version = "n/a"
@@ -104,6 +158,7 @@ def preflight_check() -> (int, bool, dict):
             service_name,
             package_name,
         )
+        logger.info("Try '--package-name=%s'", package_name)
         return (1, False, {})
 
     return (
