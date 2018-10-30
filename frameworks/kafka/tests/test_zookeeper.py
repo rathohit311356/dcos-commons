@@ -8,14 +8,14 @@ import sdk_plan
 import sdk_security
 import sdk_utils
 
-from tests import config, test_utils
+from tests import config, client
 
 
 pytestmark = pytest.mark.skip(reason="INFINITY-3363: Skipping test until it is better implemented")
 
 
 @pytest.fixture(scope="module", autouse=True)
-def zookeeper_server(configure_security):
+def zookeeper_service(configure_security):
     service_options = sdk_utils.merge_dictionaries(
         sdk_networks.ENABLE_VIRTUAL_NETWORKS_OPTIONS,
         {"service": {"name": config.ZOOKEEPER_SERVICE_NAME}},
@@ -55,13 +55,23 @@ def zookeeper_server(configure_security):
         sdk_security.cleanup_security(config.ZOOKEEPER_SERVICE_NAME, service_account_info)
 
 
+@pytest.fixture(scope="module")
+def kafka_client():
+    try:
+        kafka_client = client.KafkaClient("kafka-client", config.PACKAGE_NAME, config.SERVICE_NAME)
+        kafka_client.install()
+        yield kafka_client
+    finally:
+        kafka_client.uninstall()
+
+
 @pytest.fixture(scope="module", autouse=True)
-def kafka_server(zookeeper_server):
+def kafka_server(zookeeper_service, kafka_client):
     try:
 
         # Get the zookeeper DNS values
         zookeeper_dns = sdk_networks.get_endpoint(
-            zookeeper_server["package_name"], zookeeper_server["service"]["name"], "clientport"
+            zookeeper_service["package_name"], zookeeper_service["service"]["name"], "clientport"
         )["dns"]
 
         sdk_install.uninstall(config.PACKAGE_NAME, config.SERVICE_NAME)
@@ -74,7 +84,7 @@ def kafka_server(zookeeper_server):
         )
 
         # wait for brokers to finish registering before starting tests
-        test_utils.broker_count_check(config.DEFAULT_BROKER_COUNT, service_name=config.SERVICE_NAME)
+        kafka_client.connect(config.DEFAULT_BROKER_COUNT)
 
         yield  # let the test session execute
     finally:
@@ -83,7 +93,7 @@ def kafka_server(zookeeper_server):
 
 @pytest.mark.sanity
 @pytest.mark.zookeeper
-def test_zookeeper_reresolution(kafka_server):
+def test_zookeeper_reresolution():
 
     # First get the last logs lines for the kafka brokers
     broker_log_line = []

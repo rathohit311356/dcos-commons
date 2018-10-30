@@ -5,7 +5,6 @@ import logging
 import pytest
 
 import sdk_auth
-import sdk_cmd
 import sdk_hosts
 import sdk_install
 import sdk_networks
@@ -61,7 +60,7 @@ def kerberos(configure_security):
 
 
 @pytest.fixture(scope="module")
-def zookeeper_server(kerberos):
+def zookeeper_service(kerberos):
     service_options = {
         "service": {
             "name": config.ZOOKEEPER_SERVICE_NAME,
@@ -110,11 +109,11 @@ def zookeeper_server(kerberos):
 
 
 @pytest.fixture(scope="module", autouse=True)
-def kafka_server(kerberos, zookeeper_server):
+def kafka_server(kerberos, zookeeper_service, kafka_client: client.KafkaClient):
 
     # Get the zookeeper DNS values
     zookeeper_dns = sdk_networks.get_endpoint(
-        zookeeper_server["package_name"], zookeeper_server["service"]["name"], "clientport"
+        zookeeper_service["package_name"], zookeeper_service["service"]["name"], "clientport"
     )["dns"]
 
     service_options = {
@@ -143,7 +142,8 @@ def kafka_server(kerberos, zookeeper_server):
             timeout_seconds=30 * 60,
         )
 
-        yield {**service_options, **{"package_name": config.PACKAGE_NAME}}
+        kafka_client.connect(config.DEFAULT_BROKER_COUNT)
+        yield
     finally:
         sdk_install.uninstall(config.PACKAGE_NAME, config.SERVICE_NAME)
 
@@ -151,8 +151,10 @@ def kafka_server(kerberos, zookeeper_server):
 @pytest.fixture(scope="module", autouse=True)
 def kafka_client(kerberos):
     try:
-        kafka_client = client.KafkaClient("kafka-client")
-        kafka_client.install(kerberos)
+        kafka_client = client.KafkaClient(
+            "kafka-client", config.PACKAGE_NAME, config.SERVICE_NAME, kerberos
+        )
+        kafka_client.install()
 
         yield kafka_client
     finally:
@@ -163,24 +165,9 @@ def kafka_client(kerberos):
 @sdk_utils.dcos_ee_only
 @pytest.mark.zookeeper
 @pytest.mark.sanity
-def test_client_can_read_and_write(kafka_client: client.KafkaClient, kafka_server, kerberos):
-
+def test_client_can_read_and_write(kafka_client: client.KafkaClient):
     topic_name = "authn.test"
-    sdk_cmd.svc_cli(
-        kafka_server["package_name"],
-        kafka_server["service"]["name"],
-        "topic create {}".format(topic_name),
-    )
-
-    kafka_client.connect(kafka_server)
+    kafka_client.create_topic(topic_name)
 
     user = "client"
-    write_success, read_successes, _ = kafka_client.can_write_and_read(
-        user, kafka_server, topic_name, kerberos
-    )
-    assert write_success, "Write failed (user={})".format(user)
-    assert read_successes, (
-        "Read failed (user={}): "
-        "MESSAGES={} "
-        "read_successes={}".format(user, kafka_client.MESSAGES, read_successes)
-    )
+    kafka_client.check_users_can_read_and_write([user], topic_name)

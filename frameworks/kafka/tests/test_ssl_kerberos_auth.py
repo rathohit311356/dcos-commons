@@ -2,7 +2,6 @@ import logging
 import pytest
 
 import sdk_auth
-import sdk_cmd
 import sdk_install
 import sdk_utils
 
@@ -19,7 +18,8 @@ log = logging.getLogger(__name__)
 pytestmark = [
     sdk_utils.dcos_ee_only,
     pytest.mark.skipif(
-        sdk_utils.dcos_version_less_than("1.10"), reason="TLS tests require DC/OS 1.10+")
+        sdk_utils.dcos_version_less_than("1.10"), reason="TLS tests require DC/OS 1.10+"
+    ),
 ]
 
 
@@ -53,7 +53,7 @@ def kerberos(configure_security):
 
 
 @pytest.fixture(scope="module", autouse=True)
-def kafka_server(kerberos, service_account):
+def kafka_server(kerberos, service_account, kafka_client: client.KafkaClient):
     """
     A pytest fixture that installs a Kerberized kafka service.
 
@@ -86,7 +86,8 @@ def kafka_server(kerberos, service_account):
             timeout_seconds=30 * 60,
         )
 
-        yield {**service_kerberos_options, **{"package_name": config.PACKAGE_NAME}}
+        kafka_client.connect(config.DEFAULT_BROKER_COUNT)
+        yield
     finally:
         sdk_install.uninstall(config.PACKAGE_NAME, config.SERVICE_NAME)
 
@@ -94,8 +95,10 @@ def kafka_server(kerberos, service_account):
 @pytest.fixture(scope="module", autouse=True)
 def kafka_client(kerberos):
     try:
-        kafka_client = client.KafkaClient("kafka-client")
-        kafka_client.install(kerberos)
+        kafka_client = client.KafkaClient(
+            "kafka-client", config.PACKAGE_NAME, config.SERVICE_NAME, kerberos
+        )
+        kafka_client.install()
 
         # TODO: This flag should be set correctly.
         kafka_client._is_tls = True
@@ -108,25 +111,7 @@ def kafka_client(kerberos):
 
 
 @pytest.mark.sanity
-def test_client_can_read_and_write(kafka_client: client.KafkaClient, kafka_server, kerberos):
-
+def test_client_can_read_and_write(kafka_client: client.KafkaClient):
     topic_name = "tls.topic"
-    sdk_cmd.svc_cli(
-        kafka_server["package_name"],
-        kafka_server["service"]["name"],
-        "topic create {}".format(topic_name),
-    )
-
-    kafka_client.connect(kafka_server)
-
-    user = "client"
-    write_success, read_successes, _ = kafka_client.can_write_and_read(
-        user, kafka_server, topic_name, kerberos
-    )
-
-    assert write_success, "Write failed (user={})".format(user)
-    assert read_successes, (
-        "Read failed (user={}): "
-        "MESSAGES={} "
-        "read_successes={}".format(user, kafka_client.MESSAGES, read_successes)
-    )
+    kafka_client.create_topic(topic_name)
+    kafka_client.check_users_can_read_and_write(["client"], topic_name)
